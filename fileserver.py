@@ -139,34 +139,35 @@ class Courseware:
     def __init__(self, path: str, passwd: str = ""):
         self.path = os.path.abspath(path)
         self.passwd = passwd
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()   # 可重入：_content_clip 会在锁内被调用
         self.page = 1
         self.total = 0
         self.version = 0
         self.renderer = "none"          # "pymupdf" | "none"
+        self.count_source = "无"        # 页面总数是怎么得到的
+        self.trim = True                # 自动裁掉白边，让内容更接近全屏
+        self.zoom = 2.5                 # 渲染倍率（越大越清晰）
         self._doc = None
         self._cache = OrderedDict()
+        self._clip_cache = {}
         self.refresh()
 
     # -- file handling ----------------------------------------------------
     def refresh(self) -> bool:
-        """(Re)open the PDF file. Returns True when a file is available."""
+        """(Re)open the PDF file. Returns True when the file is available."""
         doc = None
         total = 0
-        renderer = "none"
-        try:
-            import fitz  # PyMuPDF (optional)
-        except ImportError:
-            fitz = None
-        if fitz is not None and os.path.isfile(self.path):
+        source = "无课件文件"
+        if os.path.isfile(self.path):
             try:
+                import fitz                      # PyMuPDF（可选依赖）
                 doc = fitz.open(self.path)
                 total = doc.page_count
-                renderer = "pymupdf"
+                source = "PyMuPDF"
+            except ImportError:
+                total, source = detect_pdf_pages(self.path)
             except Exception:
-                doc = None
-        if doc is None and os.path.isfile(self.path):
-            total = count_pdf_pages(self.path)
+                total, source = detect_pdf_pages(self.path)
         with self.lock:
             if self._doc is not None:
                 try:
@@ -175,19 +176,23 @@ class Courseware:
                     pass
             self._doc = doc
             self.total = total
-            self.renderer = renderer
+            self.count_source = source
+            self.renderer = "pymupdf" if doc is not None else "none"
             self._cache.clear()
+            self._clip_cache.clear()
             if total:
                 self.page = min(max(1, self.page), total)
             self.version += 1
         return doc is not None
 
-    def render(self, page: int):
+    # -- rendering --------------------------------------------------------
+    def render(self, page: int, zoom: float = None):
         """Return PNG bytes for *page* (1-based) or None."""
+        zoom = float(zoom or self.zoom)
+        key = (page, round(zoom, 2), bool(self.trim))
         with self.lock:
             if self._doc is None:
                 return None
-            key = page
             if key in self._cache:
                 self._cache.move_to_end(key)
                 return self._cache[key]
@@ -201,17 +206,105 @@ class Courseware:
                     return None
                 doc = self._doc
                 idx = max(0, min(page - 1, doc.page_count - 1))
-                zoom = 1.6
-                pix = doc.load_page(idx).get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+            matrix = fitz.Matrix(zoom, zoom)
+            clip = self._content_clip(idx) if self.trim else None
+            with self.lock:
+                if clip is not None:
+                    pix = doc.load_page(idx).get_pixmap(matrix=matrix, clip=clip)
+                else:
+                    pix = doc.load_page(idx).get_pixmap(matrix=matrix)
                 data = pix.tobytes("png")
         except Exception:
             return None
         with self.lock:
-            self._cache[page] = data
-            self._cache.move_to_end(page)
-            while len(self._cache) > 8:
+            self._cache[key] = data
+            self._cache.move_to_end(key)
+            while len(self._cache) > 6:
                 self._cache.popitem(last=False)
         return data
+
+    def _content_clip(self, idx: int):
+        """Work out the region of the page worth showing (cached).
+
+        The result keeps the slide's original proportions and never cuts
+        into the content, but drops the surrounding white margin so the
+        page can be shown close to full screen.
+        """
+        if idx in self._clip_cache:
+            return self._clip_cache[idx]
+        clip = None
+        try:
+            import fitz
+            with self.lock:
+                if self._doc is None:
+                    return None
+                page = self._doc.load_page(idx)
+            rect = page.rect
+            page_w, page_h = rect.width, rect.height
+            if page_w <= 0 or page_h <= 0:
+                return None
+            probe = page.get_pixmap(matrix=fitz.Matrix(0.2, 0.2),
+                                    colorspace=fitz.csGRAY)
+            width, height, samples = probe.width, probe.height, probe.samples
+            if width < 8 or height < 8:
+                return None
+            threshold = 245
+            min_x, min_y, max_x, max_y = width, height, -1, -1
+            for y in range(height):
+                row = samples[y * width:(y + 1) * width]
+                for x in range(width):
+                    if row[x] < threshold:
+                        if x < min_x:
+                            min_x = x
+                        if x > max_x:
+                            max_x = x
+                        if y < min_y:
+                            min_y = y
+                        if y > max_y:
+                            max_y = y
+            if max_x < 0:            # 整页空白，保持原样
+                self._clip_cache[idx] = None
+                return None
+
+            # 内容区域（页面坐标）
+            cx0 = rect.x0 + page_w * min_x / width
+            cx1 = rect.x0 + page_w * (max_x + 1) / width
+            cy0 = rect.y0 + page_h * min_y / height
+            cy1 = rect.y0 + page_h * (max_y + 1) / height
+            content_w = max(cx1 - cx0, 1.0)
+            content_h = max(cy1 - cy0, 1.0)
+            aspect = page_w / page_h
+
+            # 把内容区域扩展成与整页相同的比例（只扩不裁，内容不会丢）
+            if content_w / content_h > aspect:
+                new_w, new_h = content_w, content_w / aspect
+            else:
+                new_h, new_w = content_h, content_h * aspect
+
+            # 最多放大到 1.6 倍，避免小元素被放得过大
+            new_w = max(new_w, page_w / 1.6)
+            new_h = max(new_h, page_h / 1.6)
+            if new_h > page_h:
+                new_h = page_h
+                new_w = new_h * aspect
+            if new_w > page_w:
+                new_w = page_w
+                new_h = new_w / aspect
+
+            center_x = (cx0 + cx1) / 2
+            center_y = (cy0 + cy1) / 2
+            clip = fitz.Rect(
+                max(rect.x0, center_x - new_w / 2),
+                max(rect.y0, center_y - new_h / 2),
+                min(rect.x1, center_x + new_w / 2),
+                min(rect.y1, center_y + new_h / 2),
+            )
+            if clip.is_empty or clip.width <= 1 or clip.height <= 1:
+                clip = None
+        except Exception:
+            clip = None
+        self._clip_cache[idx] = clip
+        return clip
 
     # -- state ------------------------------------------------------------
     def state(self) -> dict:
@@ -221,6 +314,8 @@ class Courseware:
                 "total": self.total,
                 "version": self.version,
                 "renderer": self.renderer,
+                "count_source": self.count_source,
+                "trim": self.trim,
                 "has_file": os.path.isfile(self.path),
                 "name": os.path.basename(self.path),
             }
@@ -232,25 +327,93 @@ class Courseware:
             self.version += 1
             return self.page
 
+    def set_trim(self, enabled: bool) -> bool:
+        with self.lock:
+            self.trim = bool(enabled)
+            self.version += 1
+            return self.trim
+
     def check_pass(self, given: str) -> bool:
         if not self.passwd:
             return True
         return secrets.compare_digest(str(given or ""), self.passwd)
 
 
-def count_pdf_pages(path: str) -> int:
-    """Rough page count used when PyMuPDF is not installed."""
+def scan_pdf_page_count(data: bytes) -> int:
+    """Count pages of a PDF by scanning its raw bytes.
+
+    Works without any third-party library: it understands plain objects as
+    well as compressed object streams (/ObjStm), which is where most PDF
+    producers store the page tree.
+    """
+    import zlib
+
+    pages = 0
+    best_count = 0
+
+    objects = list(re.finditer(rb"(\d+)\s+(\d+)\s+obj\b", data))
+    streams = []
+    for match in objects:
+        start = match.end()
+        end = data.find(b"endobj", start)
+        if end == -1:
+            continue
+        body = data[start:end]
+        if re.search(rb"/Type\s*/ObjStm\b", body):
+            streams.append(body)
+            continue
+        if re.search(rb"/Type\s*/Pages\b", body):
+            found = re.search(rb"/Count\s+(\d+)", body)
+            if found:
+                best_count = max(best_count, int(found.group(1)))
+        elif re.search(rb"/Type\s*/Page\b", body):
+            pages += 1
+
+    # 页面树常常被压进 /ObjStm，需要解压后再数一次
+    for body in streams:
+        head, sep, tail = body.partition(b"stream")
+        if not sep:
+            continue
+        raw = tail.lstrip(b"\r\n")
+        cut = raw.rfind(b"endstream")
+        if cut != -1:
+            raw = raw[:cut]
+        content = None
+        for candidate in (raw, raw.strip(b"\r\n")):
+            try:
+                content = zlib.decompress(candidate)
+                break
+            except Exception:
+                try:
+                    content = zlib.decompressobj().decompress(candidate)
+                    break
+                except Exception:
+                    continue
+        if not content:
+            continue
+        pages += len(re.findall(rb"/Type\s*/Page\b", content))
+        for found in re.findall(rb"/Count\s+(\d+)", content):
+            best_count = max(best_count, int(found))
+
+    return max(pages, best_count)
+
+
+def detect_pdf_pages(path: str):
+    """Return (page_count, source). Tries pypdf, then a built-in scanner."""
+    try:
+        from pypdf import PdfReader
+        return len(PdfReader(path).pages), "pypdf"
+    except Exception:
+        pass
     try:
         with open(path, "rb") as fp:
             data = fp.read()
     except OSError:
-        return 0
-    best = 0
-    for m in re.finditer(rb"/Type\s*/Pages[^>]*?/Count\s+(\d+)", data, re.S):
-        best = max(best, int(m.group(1)))
-    if not best:
-        best = len(re.findall(rb"/Type\s*/Page[^s]", data))
-    return best
+        return 0, "无法读取课件文件"
+    count = scan_pdf_page_count(data)
+    if count:
+        return count, "内置扫描器"
+    return 0, "未能识别（建议安装 pymupdf 或 pypdf）"
 
 
 # --------------------------------------------------------------------------
@@ -310,8 +473,10 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/courseware/state":
                 return self._json(self.server.courseware.state())
             if path == "/api/courseware/page.png":
-                page = int((parse_qs(parsed.query).get("page") or ["1"])[0])
-                data = self.server.courseware.render(page)
+                query = parse_qs(parsed.query)
+                page = int((query.get("page") or ["1"])[0])
+                zoom = float((query.get("zoom") or ["0"])[0]) or None
+                data = self.server.courseware.render(page, zoom)
                 if data is None:
                     return self._error(404, "无法渲染该页（未安装 PyMuPDF？）")
                 return self._send(200, data, "image/png",
@@ -349,6 +514,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._handle_courseware_page()
             if path == "/api/courseware/refresh":
                 return self._handle_courseware_refresh()
+            if path == "/api/courseware/trim":
+                return self._handle_courseware_trim()
             return self._error(404, "页面不存在")
         except BrokenPipeError:
             pass
@@ -572,6 +739,22 @@ class Handler(BaseHTTPRequestHandler):
         ok = cw.refresh()
         return self._json({"ok": True, "has_file": ok, "state": cw.state()})
 
+    def _handle_courseware_trim(self):
+        cw = self.server.courseware
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = 0
+        raw = self.rfile.read(length) if length else b"{}"
+        try:
+            data = json.loads(raw.decode("utf-8") or "{}")
+        except ValueError:
+            data = {}
+        if not cw.check_pass(data.get("pass", "")):
+            return self._json({"ok": False, "error": "控制口令不正确"}, 403)
+        cw.set_trim(bool(data.get("value", True)))
+        return self._json({"ok": True, "state": cw.state()})
+
     def _handle_delete(self):
         try:
             length = int(self.headers.get("Content-Length", "0"))
@@ -606,22 +789,24 @@ STUDENT_HTML = r"""<!DOCTYPE html>
 <style>
   html,body { margin:0; height:100%; background:#0b0f16; color:#e2e8f0;
               font-family:"Segoe UI","Microsoft YaHei",system-ui,sans-serif; }
-  #stage { height:100%; display:flex; align-items:center; justify-content:center;
-           overflow:hidden; position:relative; }
-  #stage img { max-width:100%; max-height:100%; object-fit:contain; }
+  #stage { height:100%; overflow:hidden; position:relative; background:#05070b; }
+  #stage img { width:100%; height:100%; object-fit:contain; display:block; }
+  #stage.actual { overflow:auto; }
+  #stage.actual img { width:auto; height:auto; max-width:none; max-height:none; margin:0 auto; }
   #stage iframe { width:100%; height:100%; border:0; background:#fff; }
   #hud { position:fixed; right:16px; bottom:14px; background:rgba(8,15,26,.78);
          border:1px solid #263449; color:#e2e8f0; padding:7px 14px; border-radius:999px;
          font-size:14px; }
   #hud b { color:#38bdf8; }
-  #tip { position:fixed; left:16px; bottom:14px; color:#64748b; font-size:12px; }
+  #tip { position:fixed; left:16px; bottom:14px; color:#64748b; font-size:12px;
+         background:rgba(8,15,26,.6); padding:4px 10px; border-radius:999px; }
   #wait { color:#64748b; font-size:15px; text-align:center; }
 </style>
 </head>
 <body>
 <div id="stage"><div id="wait">正在等待老师推送课件…</div></div>
 <div id="hud">第 <b id="pg">-</b> 页</div>
-<div id="tip">按 H 可隐藏/显示页码</div>
+<div id="tip">按 H 隐藏页码 · 按 Z 或点击图片切换 适应窗口 / 原始大小</div>
 <script>
 let lastKey = "", lastPage = -1, total = 0, renderer = "none", hasFile = false;
 const $ = id => document.getElementById(id);
@@ -650,7 +835,14 @@ function poll(){
 }
 setInterval(poll, 1000); poll();
 
+function toggleFit(){
+  $("stage").classList.toggle("actual");
+}
+document.addEventListener("click", e=>{
+  if(e.target && e.target.tagName === "IMG") toggleFit();
+});
 document.addEventListener("keydown", e=>{
+  if(e.key.toLowerCase() === "z"){ toggleFit(); }
   if(e.key.toLowerCase() === "h"){
     const hud = $("hud"), tip = $("tip");
     const hide = hud.style.display !== "none";
@@ -696,8 +888,9 @@ TEACHER_HTML = r"""<!DOCTYPE html>
   #msg { font-size:13px; margin-top:10px; }
   #msg.ok { color:var(--ok); } #msg.err { color:var(--warn); }
   .preview { background:#0b0f16; border-radius:10px; overflow:hidden;
-             display:flex; align-items:center; justify-content:center; min-height:420px; }
-  .preview img { max-width:100%; max-height:70vh; }
+             display:flex; align-items:center; justify-content:center;
+             height:min(72vh, 820px); }
+  .preview img { width:100%; height:100%; object-fit:contain; }
   .preview iframe { width:100%; height:70vh; border:0; background:#fff; }
   .linkbox { font-size:13px; color:var(--muted); word-break:break-all; }
   .linkbox code { color:var(--accent); }
@@ -733,6 +926,9 @@ TEACHER_HTML = r"""<!DOCTYPE html>
         <span id="totalTxt" style="color:var(--muted);font-size:13px"></span>
         <button class="ghost" id="next">下一页 ▶</button>
         <input type="range" id="slider" min="1" max="1" value="1">
+        <label style="display:flex;align-items:center;gap:6px;margin:0;font-size:13px;color:var(--fg)">
+          <input type="checkbox" id="trimChk" style="width:auto"> 自动裁白边（内容更满屏）
+        </label>
         <button id="reload">重新载入课件</button>
       </div>
       <div class="row" style="margin-top:12px">
@@ -754,6 +950,7 @@ TEACHER_HTML = r"""<!DOCTYPE html>
 const $ = id => document.getElementById(id);
 let pass = localStorage.getItem("courseware_pass") || "";
 let total = 0, page = 1, renderer = "none", hasFile = false, lastKey = "";
+let countSource = "";
 
 function showMsg(t, ok){ $("msg").textContent = t; $("msg").className = "msg " + (ok?"ok":"err"); }
 
@@ -772,13 +969,17 @@ function renderPreview(p){
 
 function apply(st){
   total = st.total; page = st.page; renderer = st.renderer; hasFile = st.has_file;
+  countSource = st.count_source || "";
+  $("trimChk").checked = !!st.trim;
   $("totalTxt").textContent = total ? ("共 " + total + " 页") : "";
   $("pageIn").value = page;
   $("pageIn").max = total || 1;
   $("slider").max = total || 1;
   $("slider").value = page;
-  $("status").textContent = "状态：第 " + page + " 页 · " +
+  $("status").textContent = "状态：第 " + page + " 页" +
+      (total ? " / 共 " + total + " 页" : "（总页数未知）") + " · " +
       (renderer === "pymupdf" ? "服务端渲染" : "浏览器渲染") +
+      (countSource ? " · 页数来源：" + countSource : "") +
       (hasFile ? "" : " · 无课件文件");
   renderPreview(page);
 }
@@ -820,6 +1021,14 @@ $("reload").onclick = ()=>{
     .then(r=>r.json()).then(r=>{
       if(r.ok){ apply(r.state); showMsg("课件已重新载入", true); }
       else showMsg(r.error||"重新载入失败", false);
+    });
+};
+$("trimChk").onchange = e=>{
+  fetch("/api/courseware/trim", {method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({value: e.target.checked, pass: pass})})
+    .then(r=>r.json()).then(r=>{
+      if(r.ok){ apply(r.state); showMsg(e.target.checked ? "已开启裁白边" : "已关闭裁白边", true); }
+      else showMsg(r.error || "设置失败", false);
     });
 };
 $("studUrl").textContent = location.origin + "/courseware";
@@ -1070,8 +1279,13 @@ def main(argv=None):
     print(" 收集目录 : %s" % submit_dir)
     print(" 本机访问 : http://127.0.0.1:%d" % args.port)
     print(" 局域网   : http://%s:%d" % (local_ip(), args.port))
-    print(" 同步课件 : %s%s" % (ppt_path, "  (共 %d 页)" % courseware.total
-                                if courseware.total else "  (未找到或无法读取)"))
+    if courseware.total:
+        print(" 同步课件 : %s  (共 %d 页，识别方式: %s)"
+              % (ppt_path, courseware.total, courseware.count_source))
+    else:
+        print(" 同步课件 : %s  (未找到文件或未能识别页数)" % ppt_path)
+        print("           建议安装依赖: pip install -r requirements.txt")
+        print("           (PyMuPDF 用于服务端渲染, pypdf 用于页数识别)")
     print(" 学生端   : http://%s:%d/courseware" % (local_ip(), args.port))
     print(" 教师端   : http://%s:%d/teacher" % (local_ip(), args.port))
     print(" 按 Ctrl+C 停止服务")
